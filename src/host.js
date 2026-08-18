@@ -9,8 +9,10 @@
 //     读取失败时回退到客户端传来的最近 8 条上下文；
 //   - 再叠加该旁路之前的 Q&A 历史 + 被提问的 AI 输出 + 当前问题；
 //   - aside-poll：供客户端轮询增量文本与完成状态；
-//   - aside-load / aside-delete / aside-clear：旁路问答记录按消息持久化（进程内），
+//   - aside-load / aside-delete / aside-clear：旁路问答记录按消息持久化，
 //     支持加载、单条删除与清空；
+//   - 磁盘持久化：记录写入工作区根目录的 .aside-confirm.json（500ms 防抖、
+//     串行写、损坏容错），插件激活时自动读回；建议在 .gitignore 中忽略该文件；
 //   - 提示词与错误信息随客户端传入的语言（zh/en）切换。
 return {
   inject: ['timer'],
@@ -19,6 +21,12 @@ return {
     if (llm === undefined) return
     const defaultModel = ctx.get('agentDefaultModel')
     const sessionQuery = ctx.get('sessionQuery')
+    const fsService = ctx.get('fs')
+    const sandboxPolicy = ctx.get('sandboxPolicy')
+    const workspaceRoot = sandboxPolicy !== undefined && typeof sandboxPolicy.workspaceRoot === 'string' && sandboxPolicy.workspaceRoot !== ''
+      ? sandboxPolicy.workspaceRoot
+      : null
+    const STORE_PATH = workspaceRoot !== null ? workspaceRoot + '/.aside-confirm.json' : null
 
     const PROMPTS = {
       zh: [
@@ -78,6 +86,64 @@ return {
     const histories = new Map()
     let seq = 0
 
+    let saveTimer = null
+    let dirty = false
+    let saving = false
+
+    function snapshot() {
+      const items = {}
+      for (const pair of histories.entries()) {
+        items[pair[0]] = pair[1].entries
+      }
+      return JSON.stringify({ version: 1, items: items })
+    }
+
+    async function doSave() {
+      if (fsService === undefined || STORE_PATH === null) return
+      while (dirty) {
+        dirty = false
+        const content = snapshot()
+        try {
+          const target = await fsService.resolve(STORE_PATH)
+          await fsService.writeText(target, content)
+        } catch (err) {
+          console.error('[aside-confirm] 写入持久化记录失败：', err)
+        }
+      }
+    }
+
+    function scheduleSave() {
+      if (fsService === undefined || STORE_PATH === null) return
+      dirty = true
+      if (saving) return
+      if (saveTimer === null) {
+        saveTimer = ctx.timeout(function () {
+          saveTimer = null
+          saving = true
+          void doSave().then(function () { saving = false })
+        }, 500)
+      }
+    }
+
+    void (async () => {
+      if (fsService === undefined || STORE_PATH === null) return
+      try {
+        const target = await fsService.resolve(STORE_PATH)
+        const stat = await fsService.stat(target)
+        if (stat === undefined) return
+        const raw = await fsService.readText(target)
+        const parsed = JSON.parse(raw)
+        if (parsed && typeof parsed === 'object' && parsed.items && typeof parsed.items === 'object') {
+          for (const key of Object.keys(parsed.items)) {
+            const entries = parsed.items[key]
+            if (Array.isArray(entries)) histories.set(key, { entries: entries })
+          }
+        }
+      } catch (err) {
+        console.error('[aside-confirm] 加载持久化记录失败：', err)
+      }
+    })()
+
     function surfaceBlocksText(blocks, maxLen) {
       const parts = []
       for (const b of blocks || []) {
@@ -93,13 +159,13 @@ return {
 
     async function loadSurfaceMessages(sessionId) {
       if (sessionQuery === undefined || typeof sessionId !== 'string' || sessionId === '') return null
-      let snapshot
+      let snapshot2
       try {
-        snapshot = await sessionQuery.readSurface(sessionId)
+        snapshot2 = await sessionQuery.readSurface(sessionId)
       } catch (err) {
         return null
       }
-      const events = Array.isArray(snapshot && snapshot.events) ? snapshot.events : []
+      const events = Array.isArray(snapshot2 && snapshot2.events) ? snapshot2.events : []
       const all = []
       for (const ev of events) {
         if (!ev || typeof ev.type !== 'string') continue
@@ -143,6 +209,7 @@ return {
       const list = histories.get(messageId)
       if (list !== undefined && Number.isInteger(index) && index >= 0 && index < list.entries.length) {
         list.entries.splice(index, 1)
+        scheduleSave()
       }
       return { entries: list !== undefined ? list.entries : [] }
     }))
@@ -150,6 +217,7 @@ return {
     ctx.effect(() => harness.handle('aside-clear', (args) => {
       const messageId = String((args && args.messageId) || '')
       histories.delete(messageId)
+      scheduleSave()
       return { entries: [] }
     }))
 
@@ -236,6 +304,7 @@ return {
         const list = histories.get(messageId)
         if (list !== undefined) list.entries.push(entry)
         else histories.set(messageId, { entries: [entry] })
+        scheduleSave()
       }
       void (async () => {
         const parts = []

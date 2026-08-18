@@ -66,6 +66,7 @@ After changing the code, append a new Package to the same `pluginId` with `cordi
 ### Notes
 
 - A dynamic plugin lives only in the current DSH process: after a DSH restart, define and activate it again;
+- **Aside records are persisted**: the Q&A history is written to `.aside-confirm.json` in the workspace root and restored automatically after a DSH restart (once the plugin is re-activated), keyed by message id; consider adding `.aside-confirm.json` to your project's `.gitignore`;
 - Answers use the session's currently selected default model;
 - The UI language follows the DSH language setting automatically (Chinese and English dictionaries are bundled).
 
