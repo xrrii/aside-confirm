@@ -4,9 +4,9 @@
 //   - aside-ask：校验参数后立即返回 requestId，后台消费 llm.stream 的流式输出，
 //     把增量文本写入内存状态（不经过 agent loop、不产生会话事件，主对话完全无感知）；
 //   - 分支上下文：每次提问先通过 sessionQuery.readSurface 读取主会话当前的完整
-//     模型表面（含工具调用/结果与压缩摘要），用 toolResultPruner 修剪巨型结果，
-//     按字符预算从后往前截取，作为旁路问答继承的分支历史；读取失败时回退到
-//     客户端传来的最近 8 条上下文；
+//     模型表面，并把工具调用/结果降级为纯文本（[调用工具 …] / [工具结果 …]），
+//     避免 OpenAI 协议 tool 角色配对校验问题；按字符预算从后往前截取；
+//     读取失败时回退到客户端传来的最近 8 条上下文；
 //   - 再叠加该旁路之前的 Q&A 历史 + 被提问的 AI 输出 + 当前问题；
 //   - aside-poll：供客户端轮询增量文本与完成状态；
 //   - aside-load / aside-delete / aside-clear：旁路问答记录按消息持久化（进程内），
@@ -19,14 +19,13 @@ return {
     if (llm === undefined) return
     const defaultModel = ctx.get('agentDefaultModel')
     const sessionQuery = ctx.get('sessionQuery')
-    const pruner = ctx.get('toolResultPruner')
 
     const PROMPTS = {
       zh: [
         '你是主开发会话的"旁路确认"助手。用户正在让主会话中的 agent 开发功能，',
         '对某段 AI 输出有疑问，通过你单独确认；这些问答完全不会进入主会话。',
         '每次提问都会给你三份上下文：',
-        '1. 主会话截至当前的完整模型上下文（含工具调用/结果与压缩摘要）——把它当作你继承的分支历史；',
+        '1. 主会话截至当前的完整模型上下文（工具调用与结果已文本化）——把它当作你继承的分支历史；',
         '2. 此前在该消息下的旁路问答；',
         '3. 当前问题（附被提问的 AI 输出）。',
         '请只针对【被提问的 AI 输出】和【我的问题】作答：',
@@ -41,7 +40,7 @@ return {
       en: [
         'You are the "Aside Confirm" assistant for a main development session. The user is having an agent build features in the main session and wants to clarify one piece of AI output through you alone; these Q&As never enter the main session.',
         'Every question gives you three kinds of context:',
-        '1. The main session\'s complete model context up to now (including tool calls/results and compaction summaries) — treat it as the branch history you inherit;',
+        '1. The main session\'s complete model context up to now (tool calls and results are rendered as text) — treat it as the branch history you inherit;',
         '2. The earlier aside Q&A under this message;',
         '3. The current question (with the quoted AI output).',
         'Answer ONLY about the [Quoted AI output] and [My question]:',
@@ -79,15 +78,17 @@ return {
     const histories = new Map()
     let seq = 0
 
-    function blocksCharLen(blocks) {
-      let total = 0
+    function surfaceBlocksText(blocks, maxLen) {
+      const parts = []
       for (const b of blocks || []) {
         if (!b) continue
-        if (b.type === 'text' || b.type === 'reasoning') total += String(b.text || '').length
-        else if (b.type === 'tool-call') total += String(b.name || '').length + String(b.arguments || '').length
-        else if (b.type === 'tool-result') total += blocksCharLen(b.content)
+        if (b.type === 'text') parts.push(String(b.text || ''))
+        else if (b.type === 'tool-call') parts.push('[调用工具 ' + String(b.name || '') + ']\n' + String(b.arguments || ''))
+        else if (b.type === 'tool-result') {
+          parts.push('[工具结果 ' + String(b.toolCallId || '') + ']\n' + surfaceBlocksText(b.content, 4000))
+        }
       }
-      return total
+      return parts.join('\n').slice(0, maxLen)
     }
 
     async function loadSurfaceMessages(sessionId) {
@@ -104,14 +105,16 @@ return {
         if (!ev || typeof ev.type !== 'string') continue
         try {
           if (ev.type === 'user/message') {
-            const m = ev.data
-            if (m && Array.isArray(m.content)) all.push({ id: m.id, role: 'user', content: m.content, source: m.source })
+            const text = surfaceBlocksText(ev.data && ev.data.content, 6000)
+            if (text.trim() !== '') all.push({ role: 'user', text: text })
           } else if (ev.type === 'assistant/message') {
             const m = ev.data && ev.data.message
-            if (m && Array.isArray(m.content)) all.push({ id: m.id, role: 'assistant', content: m.content, source: m.source })
+            const text = surfaceBlocksText(m && m.content, 6000)
+            if (text.trim() !== '') all.push({ role: 'assistant', text: text })
           } else if (ev.type === 'tool/result') {
             const m = ev.data && ev.data.message
-            if (m && Array.isArray(m.content)) all.push({ id: m.id, role: 'user', content: m.content, source: m.source })
+            const text = surfaceBlocksText(m && m.content, 6000)
+            if (text.trim() !== '') all.push({ role: 'user', text: text })
           }
         } catch (_err) {}
       }
@@ -119,16 +122,9 @@ return {
       let used = 0
       const BUDGET = 24000
       for (let i = all.length - 1; i >= 0; i--) {
-        let content = all[i].content
-        if (pruner !== undefined) {
-          try {
-            const pruned = pruner.pruneContent(content)
-            if (pruned !== null && Array.isArray(pruned)) content = pruned
-          } catch (_err) {}
-        }
-        const len = blocksCharLen(content)
+        const len = all[i].text.length
         if (used + len > BUDGET && picked.length > 0) break
-        picked.unshift({ id: all[i].id, role: all[i].role, content: content, source: all[i].source })
+        picked.unshift(all[i])
         used += len
         if (used > BUDGET) break
       }
@@ -177,10 +173,12 @@ return {
       if (surfaceMessages !== null) {
         for (const m of surfaceMessages) {
           messages.push({
-            id: typeof m.id === 'string' && m.id !== '' ? m.id : 'aside-surf-' + (index++),
+            id: 'aside-surf-' + (index++),
             role: m.role,
-            content: m.content,
-            source: m.source,
+            content: [{ type: 'text', text: m.text }],
+            source: m.role === 'user'
+              ? { kind: 'user' }
+              : { kind: 'model', provider: sel.provider, model: sel.model },
           })
         }
       } else {
