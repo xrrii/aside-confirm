@@ -1,9 +1,12 @@
 // aside-confirm · Host 端
 // 用法：将本文件内容作为 cordis_define 的 code.host（详见 README.md）
-// 职责：aside-ask RPC 处理器 —— 用当前默认模型直接发起旁路模型调用，
-//       不经过 agent loop、不产生会话事件，主对话完全无感知。
-//       提示词与错误信息随客户端传入的语言（zh/en）切换。
+// 职责：
+//   - aside-ask：校验参数后立即返回 requestId，后台消费 llm.stream 的流式输出，
+//     把增量文本写入内存状态（不经过 agent loop、不产生会话事件，主对话完全无感知）；
+//   - aside-poll：供客户端轮询增量文本与完成状态；
+//   - 提示词与错误信息随客户端传入的语言（zh/en）切换。
 return {
+  inject: ['timer'],
   apply(ctx) {
     const llm = ctx.get('llm')
     if (llm === undefined) return
@@ -48,6 +51,9 @@ return {
         emptyAnswer: 'Model returned no content',
       },
     }
+
+    const streams = new Map()
+    let seq = 0
 
     ctx.effect(() => harness.handle('aside-ask', async (args) => {
       const lang = args && args.lang === 'en' ? 'en' : 'zh'
@@ -95,23 +101,42 @@ return {
         maxTokens: 1600,
       }
       if (sel.reasoningEffort !== undefined) options.reasoningEffort = sel.reasoningEffort
-      const parts = []
-      let finishReason = null
-      try {
-        for await (const chunk of llm.stream(options)) {
-          if (chunk.type === 'text-delta') parts.push(chunk.text)
-          else if (chunk.type === 'finish') finishReason = chunk.reason
+
+      const requestId = 'req-' + (++seq)
+      streams.set(requestId, { text: '', done: false, error: null })
+      void (async () => {
+        const parts = []
+        let finishReason = null
+        try {
+          for await (const chunk of llm.stream(options)) {
+            if (chunk.type === 'text-delta') {
+              parts.push(chunk.text)
+              const st = streams.get(requestId)
+              if (st !== undefined) st.text = parts.join('')
+            } else if (chunk.type === 'finish') {
+              finishReason = chunk.reason
+            }
+          }
+        } catch (e) {
+          streams.set(requestId, { text: parts.join(''), done: true, error: err.callFailed + String((e && e.message) || e) })
+          return
         }
-      } catch (e) {
-        return { ok: false, error: err.callFailed + String((e && e.message) || e) }
-      }
-      if (finishReason !== null && (finishReason.kind === 'error' || finishReason.kind === 'aborted')) {
-        const failure = finishReason.failure
-        return { ok: false, error: err.callFailed + String((failure && failure.message) || finishReason.kind) }
-      }
-      const answer = parts.join('').trim()
-      if (answer === '') return { ok: false, error: err.emptyAnswer }
-      return { ok: true, answer: answer }
+        if (finishReason !== null && (finishReason.kind === 'error' || finishReason.kind === 'aborted')) {
+          const failure = finishReason.failure
+          streams.set(requestId, { text: parts.join(''), done: true, error: err.callFailed + String((failure && failure.message) || finishReason.kind) })
+          return
+        }
+        const text = parts.join('')
+        streams.set(requestId, { text: text, done: true, error: text.trim() === '' ? err.emptyAnswer : null })
+        ctx.timeout(function () { streams.delete(requestId) }, 600000)
+      })()
+      return { ok: true, requestId: requestId }
+    }))
+
+    ctx.effect(() => harness.handle('aside-poll', (args) => {
+      const st = streams.get(String(args && args.requestId))
+      if (st === undefined) return { gone: true }
+      return { text: st.text, done: st.done, error: st.error }
     }))
   },
 }

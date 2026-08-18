@@ -1,9 +1,12 @@
 // aside-confirm · 浏览器端
 // 用法：将本文件内容作为 cordis_define 的 code.client（详见 README.md）
-// 职责：消息操作行的「气泡问号」入口 + 右下角旁路面板（拖拽/缩放/Markdown 渲染），
-//       通过 host.call('aside-ask') 调用 Host 端的旁路问答。
-//       界面文案通过 DSH locale 服务自动跟随界面语言（中/英）。
+// 职责：
+//   - 消息操作行的「气泡问号」入口 + 右下角旁路面板（拖拽/缩放）；
+//   - 提问后通过 host.call('aside-ask') 启动旁路问答，再用 aside-poll 轮询增量文本，
+//     实现流式（打字机）渲染，回答以卡片分隔；
+//   - 界面文案通过 DSH locale 服务自动跟随界面语言（中/英）。
 return {
+  inject: ['timer'],
   apply(ctx) {
     const slots = ctx.get('slots')
     if (slots === undefined) return
@@ -16,7 +19,7 @@ return {
       resetTitle: '重置面板位置和大小',
       closeTitle: '关闭',
       goneHint: '那条消息已不在当前视口，请向上滚动查找。',
-      busyText: '⏳ 正在确认…（不影响主对话）',
+      streamLost: '流式连接丢失，请重试',
       hintText: '输入你的问题，AI 会单独在这里回答，不会进入主对话。',
       placeholder: '比如：这段为什么这样实现？',
       send: '提问',
@@ -31,7 +34,7 @@ return {
       resetTitle: 'Reset panel position and size',
       closeTitle: 'Close',
       goneHint: 'That message is no longer in the current view. Scroll up to find it.',
-      busyText: '⏳ Asking… (the main conversation is unaffected)',
+      streamLost: 'Stream connection lost, please retry',
       hintText: 'Type your question; the AI answers here only, outside the main conversation.',
       placeholder: 'e.g. Why is this implemented this way?',
       send: 'Ask',
@@ -70,12 +73,16 @@ return {
       '.aside-panel-ctl:hover{color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-layer-1)}',
       '.aside-panel-head-actions{display:flex;align-items:center;gap:2px}',
       '.aside-panel-body{flex:1 1 auto;min-height:0;padding:10px 12px 8px;display:flex;flex-direction:column;gap:10px;overflow-y:auto}',
+      '.aside-panel-entries{display:flex;flex-direction:column;gap:10px}',
+      '.aside-entry{background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l1);border-radius:10px;padding:10px;display:flex;flex-direction:column;gap:6px}',
       '.aside-entry-q{font-weight:600;white-space:pre-wrap}',
       '.aside-entry-err{color:var(--dsw-alias-state-error-primary);white-space:pre-wrap}',
+      '.aside-stream-cursor{display:inline-block;width:6px;height:12px;margin-left:2px;vertical-align:-2px;background:var(--dsw-alias-brand-primary,var(--dsw-alias-label-primary));animation:aside-blink 1s steps(2,start) infinite}',
+      '@keyframes aside-blink{50%{opacity:0}}',
       '.aside-md p{margin:4px 0}',
       '.aside-md ul,.aside-md ol{margin:4px 0;padding-left:18px}',
       '.aside-md li{margin:2px 0}',
-      '.aside-md pre{margin:6px 0;padding:8px 10px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l1);border-radius:8px;overflow-x:auto;font-size:12px;white-space:pre-wrap}',
+      '.aside-md pre{margin:6px 0;padding:8px 10px;background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l1);border-radius:8px;overflow-x:auto;font-size:12px;white-space:pre-wrap}',
       '.aside-md code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;background:var(--dsw-alias-bg-layer-2);padding:1px 5px;border-radius:4px}',
       '.aside-md pre code{background:transparent;padding:0;border-radius:0}',
       '.aside-md a{color:var(--dsw-alias-brand-primary);text-decoration:underline}',
@@ -93,7 +100,6 @@ return {
       '.aside-panel-send{border:none;border-radius:10px;background:var(--dsw-alias-brand-primary);color:#fff;padding:0 14px;height:34px;cursor:pointer;font-weight:600;white-space:nowrap}',
       '.aside-panel-send:disabled{opacity:.5;cursor:default}',
       '.aside-panel-resize{position:absolute;right:0;bottom:0;width:12px;height:12px;cursor:nwse-resize;touch-action:none}',
-      '.aside-panel-busy{color:var(--dsw-alias-label-secondary);font-size:12px}',
       '.aside-panel-hint{color:var(--dsw-alias-label-secondary);font-size:12px}',
     ].join('\n')))
 
@@ -123,6 +129,13 @@ return {
         })
       }, [])
       return tick
+    }
+
+    function updateEntry(entries, index, patch) {
+      const next = entries.slice()
+      if (index < 0 || index >= next.length) return entries
+      next[index] = Object.assign({}, next[index], patch)
+      return next
     }
 
     function blocksToText(blocks) {
@@ -318,36 +331,86 @@ return {
       const [resize, setResize] = React.useState(null)
       if (!state.open) return null
 
+      const startPolling = function (requestId, entryIndex) {
+        const pollOnce = async function () {
+          let res
+          try {
+            res = await host.call('aside-poll', { requestId: requestId })
+          } catch (err) {
+            res = { gone: true }
+          }
+          const cur = store.get()
+          const target = cur.entries[entryIndex]
+          if (target === undefined || target.requestId !== requestId) return
+          if (res && res.gone) {
+            store.set(Object.assign({}, cur, {
+              entries: updateEntry(cur.entries, entryIndex, { streaming: false, error: t('streamLost') }),
+            }))
+            setBusy(false)
+            return
+          }
+          if (res && res.done) {
+            if (res.error !== null && res.error !== undefined && res.error !== '') {
+              store.set(Object.assign({}, cur, {
+                entries: updateEntry(cur.entries, entryIndex, { streaming: false, error: res.error }),
+              }))
+            } else {
+              store.set(Object.assign({}, cur, {
+                entries: updateEntry(cur.entries, entryIndex, { streaming: false, answer: String(res.text || '') }),
+              }))
+            }
+            setBusy(false)
+            return
+          }
+          store.set(Object.assign({}, cur, {
+            entries: updateEntry(cur.entries, entryIndex, { answer: String(res.text || '') }),
+          }))
+          ctx.timeout(pollOnce, 250)
+        }
+        pollOnce()
+      }
+
       const send = async function () {
         const question = draft.trim()
         if (question === '' || busy) return
         setBusy(true)
-        let result
+        setDraft('')
+        const entry = { question: question, answer: '', error: null, streaming: true, requestId: null }
+        const entries = state.entries.concat([entry])
+        const entryIndex = entries.length - 1
+        store.set({
+          open: true,
+          quotedText: state.quotedText,
+          context: state.context || [],
+          entries: entries,
+          anchorEl: state.anchorEl,
+          anchorMessageId: state.anchorMessageId,
+        })
+        let started
         try {
-          result = await host.call('aside-ask', {
+          started = await host.call('aside-ask', {
             question: question,
             quotedText: state.quotedText,
             context: state.context || [],
             lang: currentLang(),
           })
         } catch (err) {
-          result = { ok: false, error: t('requestFailed') + String((err && err.message) || err) }
+          started = { ok: false, error: t('requestFailed') + String((err && err.message) || err) }
         }
-        const entry = {
-          question: question,
-          answer: result && result.ok ? result.answer : null,
-          error: result && !result.ok ? result.error : null,
+        if (started === null || started === undefined || !started.ok) {
+          const msg = started && started.error ? String(started.error) : t('requestFailed') + 'RPC'
+          const cur = store.get()
+          store.set(Object.assign({}, cur, {
+            entries: updateEntry(cur.entries, entryIndex, { streaming: false, error: msg, requestId: null }),
+          }))
+          setBusy(false)
+          return
         }
-        store.set({
-          open: true,
-          quotedText: state.quotedText,
-          context: state.context || [],
-          entries: state.entries.concat([entry]),
-          anchorEl: state.anchorEl,
-          anchorMessageId: state.anchorMessageId,
-        })
-        setBusy(false)
-        setDraft('')
+        const cur2 = store.get()
+        store.set(Object.assign({}, cur2, {
+          entries: updateEntry(cur2.entries, entryIndex, { requestId: started.requestId }),
+        }))
+        startPolling(String(started.requestId), entryIndex)
       }
 
       const goBack = function () {
@@ -416,11 +479,16 @@ return {
       if (box.height !== null) panelStyle.height = box.height + 'px'
 
       const entries = (state.entries || []).map(function (entry, i) {
+        const answerEl = entry.streaming
+          ? React.createElement('div', { className: 'aside-md' },
+              renderMarkdown(entry.answer),
+              React.createElement('span', { className: 'aside-stream-cursor' }))
+          : entry.error !== null
+            ? React.createElement('div', { className: 'aside-entry-err' }, '✗ ' + entry.error)
+            : React.createElement('div', { className: 'aside-md' }, renderMarkdown(entry.answer))
         return React.createElement('div', { key: 'e' + i, className: 'aside-entry' },
           React.createElement('div', { className: 'aside-entry-q' }, 'Q: ' + entry.question),
-          entry.error !== null
-            ? React.createElement('div', { className: 'aside-entry-err' }, '✗ ' + entry.error)
-            : React.createElement('div', { className: 'aside-md' }, renderMarkdown(entry.answer)),
+          answerEl,
         )
       })
       return React.createElement('div', { className: 'aside-panel', style: panelStyle },
@@ -459,8 +527,7 @@ return {
             ? React.createElement('div', { className: 'aside-panel-hint' }, t('goneHint'))
             : null,
           entries.length > 0 ? React.createElement('div', { className: 'aside-panel-entries' }, entries) : null,
-          busy ? React.createElement('div', { className: 'aside-panel-busy' }, t('busyText')) : null,
-          entries.length === 0 && !busy
+          entries.length === 0
             ? React.createElement('div', { className: 'aside-panel-hint' }, t('hintText'))
             : null,
         ),
