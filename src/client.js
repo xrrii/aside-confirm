@@ -2,8 +2,9 @@
 // 用法：将本文件内容作为 cordis_define 的 code.client（详见 README.md）
 // 职责：
 //   - 消息操作行的「气泡问号」入口 + 右下角旁路面板（拖拽/缩放）；
-//   - 提问后通过 host.call('aside-ask') 启动旁路问答，再用 aside-poll 轮询增量文本，
-//     实现流式（打字机）渲染，回答以卡片分隔；
+//   - 打开面板时通过 aside-load 加载该消息的历史问答，提问后通过 aside-ask 启动
+//     旁路问答、aside-poll 轮询增量文本实现流式（打字机）渲染；
+//   - 追问时携带之前的 Q&A 作为历史上下文；支持单条删除与清空（aside-delete/aside-clear）；
 //   - 界面文案通过 DSH locale 服务自动跟随界面语言（中/英）。
 return {
   inject: ['timer'],
@@ -18,8 +19,11 @@ return {
       backTitle: '回到提问的那条消息',
       resetTitle: '重置面板位置和大小',
       closeTitle: '关闭',
+      clearTitle: '清空该消息的全部旁路记录',
+      deleteTitle: '删除这条问答',
       goneHint: '那条消息已不在当前视口，请向上滚动查找。',
       streamLost: '流式连接丢失，请重试',
+      loadingText: '正在加载历史记录…',
       hintText: '输入你的问题，AI 会单独在这里回答，不会进入主对话。',
       placeholder: '比如：这段为什么这样实现？',
       send: '提问',
@@ -33,8 +37,11 @@ return {
       backTitle: 'Back to the asked message',
       resetTitle: 'Reset panel position and size',
       closeTitle: 'Close',
+      clearTitle: 'Clear all aside records for this message',
+      deleteTitle: 'Delete this Q&A',
       goneHint: 'That message is no longer in the current view. Scroll up to find it.',
       streamLost: 'Stream connection lost, please retry',
+      loadingText: 'Loading history…',
       hintText: 'Type your question; the AI answers here only, outside the main conversation.',
       placeholder: 'e.g. Why is this implemented this way?',
       send: 'Ask',
@@ -75,7 +82,10 @@ return {
       '.aside-panel-body{flex:1 1 auto;min-height:0;padding:10px 12px 8px;display:flex;flex-direction:column;gap:10px;overflow-y:auto}',
       '.aside-panel-entries{display:flex;flex-direction:column;gap:10px}',
       '.aside-entry{background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l1);border-radius:10px;padding:10px;display:flex;flex-direction:column;gap:6px}',
-      '.aside-entry-q{font-weight:600;white-space:pre-wrap}',
+      '.aside-entry-qrow{display:flex;align-items:flex-start;justify-content:space-between;gap:6px}',
+      '.aside-entry-q{flex:1;font-weight:600;white-space:pre-wrap}',
+      '.aside-entry-del{border:none;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;font-size:12px;line-height:1.4;padding:0 2px;border-radius:4px;opacity:.7}',
+      '.aside-entry-del:hover{color:var(--dsw-alias-state-error-primary);opacity:1}',
       '.aside-entry-err{color:var(--dsw-alias-state-error-primary);white-space:pre-wrap}',
       '.aside-stream-cursor{display:inline-block;width:6px;height:12px;margin-left:2px;vertical-align:-2px;background:var(--dsw-alias-brand-primary,var(--dsw-alias-label-primary));animation:aside-blink 1s steps(2,start) infinite}',
       '@keyframes aside-blink{50%{opacity:0}}',
@@ -104,7 +114,7 @@ return {
     ].join('\n')))
 
     function createPanelStore() {
-      let state = { open: false, quotedText: '', context: [], entries: [], anchorEl: null, anchorMessageId: null }
+      let state = { open: false, quotedText: '', context: [], entries: [], loading: false, anchorEl: null, anchorMessageId: null }
       const listeners = new Set()
       return {
         get: function () { return state },
@@ -293,7 +303,17 @@ return {
           if (text !== null && text.trim() !== '') context.unshift({ role: role, text: text.slice(0, 3000) })
         }
         const anchorEl = e && e.currentTarget ? e.currentTarget : null
-        store.set({ open: true, quotedText: quotedText, context: context, entries: [], anchorEl: anchorEl, anchorMessageId: props.messageId })
+        store.set({ open: true, quotedText: quotedText, context: context, entries: [], loading: true, anchorEl: anchorEl, anchorMessageId: props.messageId })
+        void (async () => {
+          let entries = []
+          try {
+            const res = await host.call('aside-load', { messageId: props.messageId })
+            if (res && Array.isArray(res.entries)) entries = res.entries
+          } catch (_err) {}
+          const cur = store.get()
+          if (cur.anchorMessageId !== props.messageId) return
+          store.set(Object.assign({}, cur, { entries: entries, loading: false }))
+        })()
       }
       const icon = React.createElement('svg', {
         width: 16,
@@ -331,6 +351,19 @@ return {
       const [resize, setResize] = React.useState(null)
       if (!state.open) return null
 
+      const refreshEntries = async function () {
+        const messageId = store.get().anchorMessageId
+        if (messageId === null) return
+        let entries = null
+        try {
+          const res = await host.call('aside-load', { messageId: messageId })
+          if (res && Array.isArray(res.entries)) entries = res.entries
+        } catch (_err) { return }
+        const cur = store.get()
+        if (cur.anchorMessageId !== messageId) return
+        store.set(Object.assign({}, cur, { entries: entries }))
+      }
+
       const startPolling = function (requestId, entryIndex) {
         const pollOnce = async function () {
           let res
@@ -360,6 +393,7 @@ return {
               }))
             }
             setBusy(false)
+            void refreshEntries()
             return
           }
           store.set(Object.assign({}, cur, {
@@ -375,6 +409,12 @@ return {
         if (question === '' || busy) return
         setBusy(true)
         setDraft('')
+        const history = []
+        for (const e of state.entries) {
+          if (e.streaming) continue
+          if (e.question) history.push({ role: 'user', text: e.question })
+          if (e.error === null && e.answer) history.push({ role: 'assistant', text: e.answer })
+        }
         const entry = { question: question, answer: '', error: null, streaming: true, requestId: null }
         const entries = state.entries.concat([entry])
         const entryIndex = entries.length - 1
@@ -383,6 +423,7 @@ return {
           quotedText: state.quotedText,
           context: state.context || [],
           entries: entries,
+          loading: state.loading,
           anchorEl: state.anchorEl,
           anchorMessageId: state.anchorMessageId,
         })
@@ -392,6 +433,8 @@ return {
             question: question,
             quotedText: state.quotedText,
             context: state.context || [],
+            history: history.slice(-20),
+            messageId: state.anchorMessageId,
             lang: currentLang(),
           })
         } catch (err) {
@@ -411,6 +454,36 @@ return {
           entries: updateEntry(cur2.entries, entryIndex, { requestId: started.requestId }),
         }))
         startPolling(String(started.requestId), entryIndex)
+      }
+
+      const deleteEntry = async function (index) {
+        const cur = store.get()
+        const messageId = cur.anchorMessageId
+        const next = cur.entries.slice()
+        next.splice(index, 1)
+        store.set(Object.assign({}, cur, { entries: next }))
+        if (messageId === null) return
+        try {
+          const res = await host.call('aside-delete', { messageId: messageId, index: index })
+          const cur2 = store.get()
+          if (res && Array.isArray(res.entries) && cur2.anchorMessageId === messageId) {
+            store.set(Object.assign({}, cur2, { entries: res.entries }))
+          }
+        } catch (_err) {}
+      }
+
+      const clearEntries = async function () {
+        const cur = store.get()
+        const messageId = cur.anchorMessageId
+        store.set(Object.assign({}, cur, { entries: [] }))
+        if (messageId === null) return
+        try {
+          const res = await host.call('aside-clear', { messageId: messageId })
+          const cur2 = store.get()
+          if (res && Array.isArray(res.entries) && cur2.anchorMessageId === messageId) {
+            store.set(Object.assign({}, cur2, { entries: res.entries }))
+          }
+        } catch (_err) {}
       }
 
       const goBack = function () {
@@ -483,11 +556,21 @@ return {
           ? React.createElement('div', { className: 'aside-md' },
               renderMarkdown(entry.answer),
               React.createElement('span', { className: 'aside-stream-cursor' }))
-          : entry.error !== null
+          : entry.error !== null && entry.error !== undefined
             ? React.createElement('div', { className: 'aside-entry-err' }, '✗ ' + entry.error)
             : React.createElement('div', { className: 'aside-md' }, renderMarkdown(entry.answer))
         return React.createElement('div', { key: 'e' + i, className: 'aside-entry' },
-          React.createElement('div', { className: 'aside-entry-q' }, 'Q: ' + entry.question),
+          React.createElement('div', { className: 'aside-entry-qrow' },
+            React.createElement('div', { className: 'aside-entry-q' }, 'Q: ' + entry.question),
+            entry.streaming
+              ? null
+              : React.createElement('button', {
+                  type: 'button',
+                  className: 'aside-entry-del',
+                  title: t('deleteTitle'),
+                  onClick: function () { void deleteEntry(i) },
+                }, '✕'),
+          ),
           answerEl,
         )
       })
@@ -515,9 +598,15 @@ return {
             React.createElement('button', {
               type: 'button',
               className: 'aside-panel-ctl',
+              title: t('clearTitle'),
+              onClick: function () { void clearEntries() },
+            }, '🗑'),
+            React.createElement('button', {
+              type: 'button',
+              className: 'aside-panel-ctl',
               title: t('closeTitle'),
               onClick: function () {
-                store.set({ open: false, quotedText: state.quotedText, context: state.context, entries: state.entries, anchorEl: state.anchorEl, anchorMessageId: null })
+                store.set({ open: false, quotedText: state.quotedText, context: state.context, entries: state.entries, loading: state.loading, anchorEl: state.anchorEl, anchorMessageId: null })
               },
             }, '✕'),
           ),
@@ -527,7 +616,10 @@ return {
             ? React.createElement('div', { className: 'aside-panel-hint' }, t('goneHint'))
             : null,
           entries.length > 0 ? React.createElement('div', { className: 'aside-panel-entries' }, entries) : null,
-          entries.length === 0
+          entries.length === 0 && state.loading
+            ? React.createElement('div', { className: 'aside-panel-hint' }, t('loadingText'))
+            : null,
+          entries.length === 0 && !state.loading
             ? React.createElement('div', { className: 'aside-panel-hint' }, t('hintText'))
             : null,
         ),
