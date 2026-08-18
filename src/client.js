@@ -43,8 +43,8 @@ return {
     let t
     if (localeService !== undefined) {
       ctx.effect(() => {
-        const d1 = localeService.register('aside-confirm', 'zh-CN', ZH)
-        const d2 = localeService.register('aside-confirm', 'en-US', EN)
+        const d1 = localeService.register('aside-confirm', 'zh', ZH)
+        const d2 = localeService.register('aside-confirm', 'en', EN)
         return function () { d1(); d2() }
       })
       t = localeService.bind('aside-confirm')
@@ -55,8 +55,8 @@ return {
     function currentLang() {
       if (localeService === undefined) return 'zh'
       const snap = localeService.getLocale()
-      const id = snap && typeof snap.id === 'string' ? snap.id : ''
-      return id.indexOf('zh') === 0 ? 'zh' : 'en'
+      const active = snap && typeof snap.active === 'string' ? snap.active : ''
+      return active.indexOf('zh') === 0 ? 'zh' : 'en'
     }
 
     ctx.effect(() => styles.insert([
