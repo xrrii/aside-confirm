@@ -2,10 +2,62 @@
 // 用法：将本文件内容作为 cordis_define 的 code.client（详见 README.md）
 // 职责：消息操作行的「气泡问号」入口 + 右下角旁路面板（拖拽/缩放/Markdown 渲染），
 //       通过 host.call('aside-ask') 调用 Host 端的旁路问答。
+//       界面文案通过 DSH locale 服务自动跟随界面语言（中/英）。
 return {
   apply(ctx) {
     const slots = ctx.get('slots')
     if (slots === undefined) return
+    const localeService = ctx.get('locale')
+
+    const ZH = {
+      askTitle: '旁路确认：就这段输出提问，不影响主对话',
+      panelTitle: '💬 旁路确认',
+      backTitle: '回到提问的那条消息',
+      resetTitle: '重置面板位置和大小',
+      closeTitle: '关闭',
+      goneHint: '那条消息已不在当前视口，请向上滚动查找。',
+      busyText: '⏳ 正在确认…（不影响主对话）',
+      hintText: '输入你的问题，AI 会单独在这里回答，不会进入主对话。',
+      placeholder: '比如：这段为什么这样实现？',
+      send: '提问',
+      requestFailed: '请求失败：',
+      slotLabel: '旁路确认',
+      panelLabel: '旁路确认面板',
+    }
+    const EN = {
+      askTitle: 'Aside confirm: ask about this output without affecting the main conversation',
+      panelTitle: '💬 Aside Confirm',
+      backTitle: 'Back to the asked message',
+      resetTitle: 'Reset panel position and size',
+      closeTitle: 'Close',
+      goneHint: 'That message is no longer in the current view. Scroll up to find it.',
+      busyText: '⏳ Asking… (the main conversation is unaffected)',
+      hintText: 'Type your question; the AI answers here only, outside the main conversation.',
+      placeholder: 'e.g. Why is this implemented this way?',
+      send: 'Ask',
+      requestFailed: 'Request failed: ',
+      slotLabel: 'Aside Confirm',
+      panelLabel: 'Aside Confirm Panel',
+    }
+
+    let t
+    if (localeService !== undefined) {
+      ctx.effect(() => {
+        const d1 = localeService.register('aside-confirm', 'zh-CN', ZH)
+        const d2 = localeService.register('aside-confirm', 'en-US', EN)
+        return function () { d1(); d2() }
+      })
+      t = localeService.bind('aside-confirm')
+    } else {
+      t = function (key) { return ZH[key] !== undefined ? ZH[key] : key }
+    }
+
+    function currentLang() {
+      if (localeService === undefined) return 'zh'
+      const snap = localeService.getLocale()
+      const id = snap && typeof snap.id === 'string' ? snap.id : ''
+      return id.indexOf('zh') === 0 ? 'zh' : 'en'
+    }
 
     ctx.effect(() => styles.insert([
       '.aside-ask-btn{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;padding:6px;border:none;border-radius:28px;background:transparent;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));cursor:pointer}',
@@ -60,6 +112,17 @@ return {
       const [state, setState] = React.useState(store.get())
       React.useEffect(function () { return store.subscribe(setState) }, [])
       return state
+    }
+
+    function useLocaleTick() {
+      const [tick, setTick] = React.useState(0)
+      React.useEffect(function () {
+        if (localeService === undefined) return
+        return localeService.subscribe(function () {
+          setTick(function (n) { return n + 1 })
+        })
+      }, [])
+      return tick
     }
 
     function blocksToText(blocks) {
@@ -195,6 +258,7 @@ return {
     function AskButton(props) {
       const nodes = props.useSession(function (s) { return s.nodes })
       const state = usePanelState()
+      useLocaleTick()
       const active = state.anchorMessageId !== null && state.anchorMessageId === props.messageId
       const onClick = function (e) {
         let quotedText = ''
@@ -236,8 +300,8 @@ return {
       return React.createElement('button', {
         type: 'button',
         className: 'aside-ask-btn',
-        title: '旁路确认：就这段输出提问，不影响主对话',
-        'aria-label': '旁路确认：就这段输出提问，不影响主对话',
+        title: t('askTitle'),
+        'aria-label': t('askTitle'),
         'data-active': active ? '' : undefined,
         onClick: onClick,
       }, icon)
@@ -245,6 +309,7 @@ return {
 
     function Panel() {
       const state = usePanelState()
+      useLocaleTick()
       const [draft, setDraft] = React.useState('')
       const [busy, setBusy] = React.useState(false)
       const [goneHint, setGoneHint] = React.useState(false)
@@ -263,9 +328,10 @@ return {
             question: question,
             quotedText: state.quotedText,
             context: state.context || [],
+            lang: currentLang(),
           })
         } catch (err) {
-          result = { ok: false, error: '请求失败：' + String((err && err.message) || err) }
+          result = { ok: false, error: t('requestFailed') + String((err && err.message) || err) }
         }
         const entry = {
           question: question,
@@ -364,24 +430,24 @@ return {
           onPointerMove: onHeadMove,
           onPointerUp: onHeadUp,
         },
-          React.createElement('span', null, '💬 旁路确认'),
+          React.createElement('span', null, t('panelTitle')),
           React.createElement('div', { className: 'aside-panel-head-actions' },
             React.createElement('button', {
               type: 'button',
               className: 'aside-panel-ctl',
-              title: '回到提问的那条消息',
+              title: t('backTitle'),
               onClick: goBack,
             }, '📍'),
             React.createElement('button', {
               type: 'button',
               className: 'aside-panel-ctl',
-              title: '重置面板位置和大小',
+              title: t('resetTitle'),
               onClick: resetBox,
             }, '↺'),
             React.createElement('button', {
               type: 'button',
               className: 'aside-panel-ctl',
-              title: '关闭',
+              title: t('closeTitle'),
               onClick: function () {
                 store.set({ open: false, quotedText: state.quotedText, context: state.context, entries: state.entries, anchorEl: state.anchorEl, anchorMessageId: null })
               },
@@ -390,19 +456,19 @@ return {
         ),
         React.createElement('div', { className: 'aside-panel-body' },
           goneHint
-            ? React.createElement('div', { className: 'aside-panel-hint' }, '那条消息已不在当前视口，请向上滚动查找。')
+            ? React.createElement('div', { className: 'aside-panel-hint' }, t('goneHint'))
             : null,
           entries.length > 0 ? React.createElement('div', { className: 'aside-panel-entries' }, entries) : null,
-          busy ? React.createElement('div', { className: 'aside-panel-busy' }, '⏳ 正在确认…（不影响主对话）') : null,
+          busy ? React.createElement('div', { className: 'aside-panel-busy' }, t('busyText')) : null,
           entries.length === 0 && !busy
-            ? React.createElement('div', { className: 'aside-panel-hint' }, '输入你的问题，AI 会单独在这里回答，不会进入主对话。')
+            ? React.createElement('div', { className: 'aside-panel-hint' }, t('hintText'))
             : null,
         ),
         React.createElement('div', { className: 'aside-panel-input' },
           React.createElement('input', {
             type: 'text',
             className: 'aside-panel-input-box',
-            placeholder: '比如：这段为什么这样实现？',
+            placeholder: t('placeholder'),
             value: draft,
             onChange: function (e) { setDraft(e.target.value) },
             onKeyDown: function (e) {
@@ -417,7 +483,7 @@ return {
             className: 'aside-panel-send',
             disabled: busy || draft.trim() === '',
             onClick: send,
-          }, '提问'),
+          }, t('send')),
         ),
         React.createElement('div', {
           className: 'aside-panel-resize',
@@ -430,13 +496,13 @@ return {
 
     slots.inject('conversation.chat.assistant-actions', function () {
       return slots.register(
-        { name: 'conversation.chat.assistant-actions', id: 'aside-confirm-ask', order: 60, label: function () { return '旁路确认' } },
+        { name: 'conversation.chat.assistant-actions', id: 'aside-confirm-ask', order: 60, label: function () { return t('slotLabel') } },
         function (props) { return React.createElement(AskButton, props) },
       )
     })
     slots.inject('shell.overlay', function () {
       return slots.register(
-        { name: 'shell.overlay', id: 'aside-confirm-panel', order: 90, label: function () { return '旁路确认面板' } },
+        { name: 'shell.overlay', id: 'aside-confirm-panel', order: 90, label: function () { return t('panelLabel') } },
         function () { return React.createElement(Panel) },
       )
     })
