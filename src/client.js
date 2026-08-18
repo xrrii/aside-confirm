@@ -115,7 +115,7 @@ return {
     ].join('\n')))
 
     function createPanelStore() {
-      let state = { open: false, quotedText: '', context: [], entries: [], loading: false, anchorEl: null, anchorMessageId: null }
+      let state = { open: false, sessionId: null, quotedText: '', context: [], entries: [], loading: false, anchorEl: null, anchorMessageId: null }
       const listeners = new Set()
       return {
         get: function () { return state },
@@ -312,7 +312,7 @@ return {
           if (text !== null && text.trim() !== '') context.unshift({ role: role, text: text.slice(0, 3000) })
         }
         const anchorEl = e && e.currentTarget ? e.currentTarget : null
-        store.set({ open: true, quotedText: quotedText, context: context, entries: [], loading: true, anchorEl: anchorEl, anchorMessageId: props.messageId })
+        store.set({ open: true, sessionId: props.sessionId !== undefined ? props.sessionId : null, quotedText: quotedText, context: context, entries: [], loading: true, anchorEl: anchorEl, anchorMessageId: props.messageId })
         void (async () => {
           let entries = []
           try {
@@ -432,6 +432,7 @@ return {
         const entries = state.entries.concat([entry])
         store.set({
           open: true,
+          sessionId: state.sessionId,
           quotedText: state.quotedText,
           context: state.context || [],
           entries: entries,
@@ -447,6 +448,7 @@ return {
             context: state.context || [],
             history: history.slice(-20),
             messageId: state.anchorMessageId,
+            sessionId: state.sessionId,
             lang: currentLang(),
           })
         } catch (err) {
@@ -621,7 +623,7 @@ return {
               className: 'aside-panel-ctl',
               title: t('closeTitle'),
               onClick: function () {
-                store.set({ open: false, quotedText: state.quotedText, context: state.context, entries: state.entries, loading: state.loading, anchorEl: state.anchorEl, anchorMessageId: null })
+                store.set({ open: false, sessionId: state.sessionId, quotedText: state.quotedText, context: state.context, entries: state.entries, loading: state.loading, anchorEl: state.anchorEl, anchorMessageId: null })
               },
             }, '✕'),
           ),
