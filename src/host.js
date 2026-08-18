@@ -3,8 +3,8 @@
 // 职责：
 //   - aside-ask：校验参数后立即返回 requestId，后台消费 llm.stream 的流式输出，
 //     把增量文本写入内存状态（不经过 agent loop、不产生会话事件，主对话完全无感知）；
-//   - 会话记忆：第一个问题注入「被提问输出 + 主会话上下文」；追问时只携带之前的
-//     旁路 Q&A 历史与当前问题，像正常对话一样连贯；
+//   - 每次提问（含追问）都携带三份上下文：被提问的 AI 输出、主会话最近 8 条上下文、
+//     该旁路之前的 Q&A 历史；
 //   - aside-poll：供客户端轮询增量文本与完成状态；
 //   - aside-load / aside-delete / aside-clear：旁路问答记录按消息持久化（进程内），
 //     支持加载、单条删除与清空；
@@ -22,9 +22,9 @@ return {
         '对某段 AI 输出有疑问，通过你单独确认；这些问答完全不会进入主会话。',
         '请只针对【被提问的 AI 输出】和【我的问题】作答：',
         '- 用简洁直白的中文回答，解释原因、含义或背景，不要客套；',
-        '- 问题如果是"为什么这样做"，结合给定的会话上下文说明可能的意图；',
-        '- 追问时，消息历史中只有此前的旁路问答和当前问题——像正常对话一样连贯地继续，',
-        '  可以呼应"你之前提到…"，不要再重复引入主会话内容；',
+        '- 问题如果是"为什么这样做"，结合给定的主会话上下文说明可能的意图；',
+        '- 每次提问都会携带主会话上下文、被提问的输出与此前的旁路问答，请结合三者连贯回答，',
+        '  可以呼应"你之前提到…"；',
         '- 只解释、不执行任何任务、不修改任何文件；',
         '- 不要编造上下文里没有的信息，拿不准就直接说拿不准；',
         '- 回答尽量控制在 400 字以内，重点优先；',
@@ -34,8 +34,8 @@ return {
         'You are the "Aside Confirm" assistant for a main development session. The user is having an agent build features in the main session and wants to clarify one piece of AI output through you alone; these Q&As never enter the main session.',
         'Answer ONLY about the [Quoted AI output] and [My question]:',
         '- Answer in concise, plain language; explain the reason, meaning, or background without pleasantries;',
-        '- For "why did it do this" questions, use the given conversation context to explain the likely intent;',
-        '- For follow-up questions, the message history contains only the earlier aside Q&A and the current question — continue coherently like a normal conversation, you may refer back with "as mentioned earlier", and do not re-introduce main-session content;',
+        '- For "why did it do this" questions, use the given main-session context to explain the likely intent;',
+        '- Every question carries the main-session context, the quoted output, and the earlier aside Q&A — answer coherently using all three, and you may refer back with "as mentioned earlier";',
         '- Only explain — never execute tasks or modify files;',
         '- Do not invent information absent from the context; say so when unsure;',
         '- Keep answers within about 400 words, priorities first;',
@@ -103,23 +103,20 @@ return {
       if (sel === undefined || typeof sel.provider !== 'string' || typeof sel.model !== 'string') {
         return { ok: false, error: err.noSelection }
       }
-      const isFollowup = history.length > 0
       const messages = []
       let index = 0
-      if (!isFollowup) {
-        for (const item of context) {
-          const text = String((item && item.text) || '').slice(0, 3000)
-          if (text.trim() === '') continue
-          const role = (item && item.role) === 'user' ? 'user' : 'assistant'
-          messages.push({
-            id: 'aside-ctx-' + (index++),
-            role: role,
-            content: [{ type: 'text', text: text }],
-            source: role === 'user'
-              ? { kind: 'user' }
-              : { kind: 'model', provider: sel.provider, model: sel.model },
-          })
-        }
+      for (const item of context) {
+        const text = String((item && item.text) || '').slice(0, 3000)
+        if (text.trim() === '') continue
+        const role = (item && item.role) === 'user' ? 'user' : 'assistant'
+        messages.push({
+          id: 'aside-ctx-' + (index++),
+          role: role,
+          content: [{ type: 'text', text: text }],
+          source: role === 'user'
+            ? { kind: 'user' }
+            : { kind: 'model', provider: sel.provider, model: sel.model },
+        })
       }
       for (const item of history) {
         const text = String((item && item.text) || '').slice(0, 4000)
@@ -135,7 +132,7 @@ return {
         })
       }
       const userParts = []
-      if (!isFollowup && quotedText.trim() !== '') {
+      if (quotedText.trim() !== '') {
         userParts.push(lang === 'en' ? '[Quoted AI output]\n' + quotedText : '【被提问的 AI 输出】\n' + quotedText)
       }
       userParts.push(lang === 'en' ? '[My question]\n' + question : '【我的问题】\n' + question)
