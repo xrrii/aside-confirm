@@ -3,8 +3,9 @@
 // 职责：
 //   - 消息操作行的「气泡问号」入口 + 右下角旁路面板（拖拽/缩放）；
 //   - 打开面板时通过 aside-load 加载该消息的历史问答，提问后通过 aside-ask 启动
-//     旁路问答、aside-poll 轮询增量文本实现流式（打字机）渲染；
-//   - 追问时携带之前的 Q&A 作为历史上下文；支持单条删除与清空（aside-delete/aside-clear）；
+//     旁路问答、aside-poll 轮询增量文本实现流式（打字机）渲染（按 requestId 定位，
+//     历史刷新不会打断进行中的流）；
+//   - 追问时携带之前的 Q&A 作为历史；支持单条删除与清空（aside-delete/aside-clear）；
 //   - 界面文案通过 DSH locale 服务自动跟随界面语言（中/英）。
 return {
   inject: ['timer'],
@@ -146,6 +147,14 @@ return {
       if (index < 0 || index >= next.length) return entries
       next[index] = Object.assign({}, next[index], patch)
       return next
+    }
+
+    function findStreamIndex(entries, requestId) {
+      for (let i = 0; i < entries.length; i++) {
+        const e = entries[i]
+        if (e && e.requestId === requestId) return i
+      }
+      return -1
     }
 
     function blocksToText(blocks) {
@@ -361,10 +370,14 @@ return {
         } catch (_err) { return }
         const cur = store.get()
         if (cur.anchorMessageId !== messageId) return
-        store.set(Object.assign({}, cur, { entries: entries }))
+        const merged = entries.slice()
+        for (const e of cur.entries) {
+          if (e && e.streaming) merged.push(e)
+        }
+        store.set(Object.assign({}, cur, { entries: merged }))
       }
 
-      const startPolling = function (requestId, entryIndex) {
+      const startPolling = function (requestId) {
         const pollOnce = async function () {
           let res
           try {
@@ -373,11 +386,11 @@ return {
             res = { gone: true }
           }
           const cur = store.get()
-          const target = cur.entries[entryIndex]
-          if (target === undefined || target.requestId !== requestId) return
+          const idx = findStreamIndex(cur.entries, requestId)
+          if (idx === -1) return
           if (res && res.gone) {
             store.set(Object.assign({}, cur, {
-              entries: updateEntry(cur.entries, entryIndex, { streaming: false, error: t('streamLost') }),
+              entries: updateEntry(cur.entries, idx, { streaming: false, error: t('streamLost') }),
             }))
             setBusy(false)
             return
@@ -385,11 +398,11 @@ return {
           if (res && res.done) {
             if (res.error !== null && res.error !== undefined && res.error !== '') {
               store.set(Object.assign({}, cur, {
-                entries: updateEntry(cur.entries, entryIndex, { streaming: false, error: res.error }),
+                entries: updateEntry(cur.entries, idx, { streaming: false, error: res.error }),
               }))
             } else {
               store.set(Object.assign({}, cur, {
-                entries: updateEntry(cur.entries, entryIndex, { streaming: false, answer: String(res.text || '') }),
+                entries: updateEntry(cur.entries, idx, { streaming: false, answer: String(res.text || '') }),
               }))
             }
             setBusy(false)
@@ -397,7 +410,7 @@ return {
             return
           }
           store.set(Object.assign({}, cur, {
-            entries: updateEntry(cur.entries, entryIndex, { answer: String(res.text || '') }),
+            entries: updateEntry(cur.entries, idx, { answer: String(res.text || '') }),
           }))
           ctx.timeout(pollOnce, 250)
         }
@@ -417,7 +430,6 @@ return {
         }
         const entry = { question: question, answer: '', error: null, streaming: true, requestId: null }
         const entries = state.entries.concat([entry])
-        const entryIndex = entries.length - 1
         store.set({
           open: true,
           quotedText: state.quotedText,
@@ -440,20 +452,23 @@ return {
         } catch (err) {
           started = { ok: false, error: t('requestFailed') + String((err && err.message) || err) }
         }
+        const cur0 = store.get()
         if (started === null || started === undefined || !started.ok) {
           const msg = started && started.error ? String(started.error) : t('requestFailed') + 'RPC'
-          const cur = store.get()
-          store.set(Object.assign({}, cur, {
-            entries: updateEntry(cur.entries, entryIndex, { streaming: false, error: msg, requestId: null }),
+          const idx = findStreamIndex(cur0.entries, null)
+          const target = idx === -1 ? cur0.entries.length - 1 : idx
+          store.set(Object.assign({}, cur0, {
+            entries: updateEntry(cur0.entries, target, { streaming: false, error: msg, requestId: null }),
           }))
           setBusy(false)
           return
         }
-        const cur2 = store.get()
-        store.set(Object.assign({}, cur2, {
-          entries: updateEntry(cur2.entries, entryIndex, { requestId: started.requestId }),
+        const idx = findStreamIndex(cur0.entries, null)
+        const target = idx === -1 ? cur0.entries.length - 1 : idx
+        store.set(Object.assign({}, cur0, {
+          entries: updateEntry(cur0.entries, target, { requestId: started.requestId }),
         }))
-        startPolling(String(started.requestId), entryIndex)
+        startPolling(String(started.requestId))
       }
 
       const deleteEntry = async function (index) {
